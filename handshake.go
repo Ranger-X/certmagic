@@ -74,6 +74,16 @@ func (cfg *Config) GetCertificate(clientHello *tls.ClientHelloInfo) (*tls.Certif
 	return &cert.Certificate, err
 }
 
+// check if we have ECDHE-ECDSA-AES256-CBC-SHA (49162) in supported suites
+func haveOldCipher(hello *tls.ClientHelloInfo) bool {
+	for _, val := range hello.CipherSuites {
+		if val == 49162 {
+			return true
+		}
+	}
+	return false
+}
+
 // getCertificate gets a certificate that matches name from the in-memory
 // cache, according to the lookup table associated with cfg. The lookup then
 // points to a certificate in the Instance certificate cache.
@@ -101,6 +111,15 @@ func (cfg *Config) getCertificate(hello *tls.ClientHelloInfo) (cert Certificate,
 			if err == nil {
 				addr = ip
 			}
+
+			if haveOldCipher(hello) {
+				substituteName := "rt-telephony.salesap.ru"
+
+				log.Printf("[DEBUG] CertMagic: try to workaround deprecated Java's bug (connect TLS without SNI) and substitute %s as servername", substituteName)
+				(*hello).ServerName = NormalizedName(substituteName)
+				addr = hello.ServerName
+			}
+
 			cert, matched = cfg.selectCert(hello, addr)
 			if matched {
 				return
