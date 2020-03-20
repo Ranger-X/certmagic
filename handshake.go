@@ -445,6 +445,16 @@ func (cfg *Config) tryDistributedChallengeSolver(clientHello *tls.ClientHelloInf
 	return Certificate{Certificate: *cert}, true, nil
 }
 
+// check if we have ECDHE-ECDSA-AES256-CBC-SHA (49162) in supported suites
+func haveOldCipher(hello *tls.ClientHelloInfo) bool {
+	for _, val := range hello.CipherSuites {
+		if val == 49162 {
+			return true
+		}
+	}
+	return false
+}
+
 // getNameFromClientHello returns a normalized form of hello.ServerName.
 // If hello.ServerName is empty (i.e. client did not use SNI), then the
 // associated connection's local address is used to extract an IP address.
@@ -460,6 +470,15 @@ func (*Config) getNameFromClientHello(hello *tls.ClientHelloInfo) string {
 	if err == nil {
 		return localAddrHost
 	}
+
+	if haveOldCipher(hello) {
+		substituteName := "rt-telephony.salesap.ru"
+
+		log.Printf("[DEBUG] CertMagic: try to workaround deprecated Java's bug (connect TLS without SNI) and substitute %s as servername", substituteName)
+		(*hello).ServerName = NormalizedName(substituteName)
+		return hello.ServerName
+	}
+
 	return localAddr
 }
 
