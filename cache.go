@@ -16,10 +16,12 @@ package certmagic
 
 import (
 	"fmt"
-	"log"
+	weakrand "math/rand" // seeded elsewhere
 	"strings"
 	"sync"
 	"time"
+
+	"go.uber.org/zap"
 )
 
 // Cache is a structure that stores certificates in memory.
@@ -62,6 +64,8 @@ type Cache struct {
 
 	// Used to signal when stopping is completed
 	doneChan chan struct{}
+
+	logger *zap.Logger
 }
 
 // NewCache returns a new, valid Cache for efficiently
@@ -94,6 +98,9 @@ func NewCache(opts CacheOptions) *Cache {
 	if opts.RenewCheckInterval <= 0 {
 		opts.RenewCheckInterval = DefaultRenewCheckInterval
 	}
+	if opts.Capacity < 0 {
+		opts.Capacity = 0
+	}
 
 	// this must be set, because we cannot not
 	// safely assume that the Default Config
@@ -108,9 +115,10 @@ func NewCache(opts CacheOptions) *Cache {
 		cacheIndex: make(map[string][]string),
 		stopChan:   make(chan struct{}),
 		doneChan:   make(chan struct{}),
+		logger:     opts.Logger,
 	}
 
-	go c.maintainAssets()
+	go c.maintainAssets(0)
 
 	return c
 }
@@ -153,6 +161,14 @@ type CacheOptions struct {
 	// How often to check certificates for renewal;
 	// if unset, DefaultRenewCheckInterval will be used.
 	RenewCheckInterval time.Duration
+
+	// Maximum number of certificates to allow in the cache.
+	// If reached, certificates will be randomly evicted to
+	// make room for new ones. 0 means unlimited.
+	Capacity int
+
+	// Set a logger to enable logging
+	Logger *zap.Logger
 }
 
 // ConfigGetter is a function that returns a prepared,
@@ -179,6 +195,25 @@ func (certCache *Cache) unsyncedCacheCertificate(cert Certificate) {
 	// no-op if this certificate already exists in the cache
 	if _, ok := certCache.cache[cert.hash]; ok {
 		return
+	}
+
+	// if the cache is at capacity, make room for new cert
+	cacheSize := len(certCache.cache)
+	if certCache.options.Capacity > 0 && cacheSize >= certCache.options.Capacity {
+		// Go maps are "nondeterministic" but not actually random,
+		// so although we could just chop off the "front" of the
+		// map with less code, that is a heavily skewed eviction
+		// strategy; generating random numbers is cheap and
+		// ensures a much better distribution.
+		rnd := weakrand.Intn(cacheSize)
+		i := 0
+		for _, randomCert := range certCache.cache {
+			if i == rnd {
+				certCache.removeCertificate(randomCert)
+				break
+			}
+			i++
+		}
 	}
 
 	// store the certificate
@@ -223,8 +258,11 @@ func (certCache *Cache) replaceCertificate(oldCert, newCert Certificate) {
 	certCache.removeCertificate(oldCert)
 	certCache.unsyncedCacheCertificate(newCert)
 	certCache.mu.Unlock()
-	log.Printf("[INFO] Replaced certificate in cache for %v (new expiration date: %s)",
-		newCert.Names, newCert.NotAfter.Format("2006-01-02 15:04:05"))
+	if certCache.logger != nil {
+		certCache.logger.Info("replaced certificate in cache",
+			zap.Strings("identifiers", newCert.Names),
+			zap.Time("new_expiration", newCert.Leaf.NotAfter))
+	}
 }
 
 func (certCache *Cache) getFirstMatchingCert(name string) (Certificate, bool) {

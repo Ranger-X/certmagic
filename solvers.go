@@ -15,6 +15,7 @@
 package certmagic
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -22,12 +23,15 @@ import (
 	"net"
 	"net/http"
 	"path"
+	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/go-acme/lego/v3/challenge"
-	"github.com/go-acme/lego/v3/challenge/tlsalpn01"
+	"github.com/libdns/libdns"
+	"github.com/mholt/acmez"
+	"github.com/mholt/acmez/acme"
 )
 
 // httpSolver solves the HTTP challenge. It must be
@@ -47,30 +51,26 @@ type httpSolver struct {
 }
 
 // Present starts an HTTP server if none is already listening on s.address.
-func (s *httpSolver) Present(domain, token, keyAuth string) error {
+func (s *httpSolver) Present(ctx context.Context, _ acme.Challenge) error {
 	solversMu.Lock()
 	defer solversMu.Unlock()
 
 	si := getSolverInfo(s.address)
 	si.count++
 	if si.listener != nil {
-		return nil
+		return nil // already be served by us
 	}
 
-	var err error
-	si.listener, err = net.Listen("tcp", s.address)
-	if err != nil {
-		if listenerAddressInUse(s.address) {
-			// if it failed just because the socket is already in use, we
-			// have no choice but to assume that whatever is using the socket
-			// can answer the challenge already
-			return nil
-		}
-		// otherwise, if the socket is not in use, something is wrong
-		return fmt.Errorf("could not start listener for HTTP challenge server: %v", err)
+	// notice the unusual error handling here; we
+	// only continue to start a challenge server if
+	// we got a listener; in all other cases return
+	ln, err := robustTryListen(s.address)
+	if ln == nil {
+		return err
 	}
 
-	// successfully bound socket, so start key auth HTTP server
+	// successfully bound socket, so save listener and start key auth HTTP server
+	si.listener = ln
 	go s.serve(si)
 
 	return nil
@@ -78,17 +78,24 @@ func (s *httpSolver) Present(domain, token, keyAuth string) error {
 
 // serve is an HTTP server that serves only HTTP challenge responses.
 func (s *httpSolver) serve(si *solverInfo) {
+	defer func() {
+		if err := recover(); err != nil {
+			buf := make([]byte, stackTraceBufferSize)
+			buf = buf[:runtime.Stack(buf, false)]
+			log.Printf("panic: http solver server: %v\n%s", err, buf)
+		}
+	}()
+	defer close(si.done)
 	httpServer := &http.Server{Handler: s.acmeManager.HTTPChallengeHandler(http.NewServeMux())}
 	httpServer.SetKeepAlivesEnabled(false)
 	err := httpServer.Serve(si.listener)
 	if err != nil && atomic.LoadInt32(&s.closed) != 1 {
 		log.Printf("[ERROR] key auth HTTP server: %v", err)
 	}
-	close(si.done)
 }
 
 // CleanUp cleans up the HTTP server if it is the last one to finish.
-func (s *httpSolver) CleanUp(domain, token, keyAuth string) error {
+func (s *httpSolver) CleanUp(ctx context.Context, _ acme.Challenge) error {
 	solversMu.Lock()
 	defer solversMu.Unlock()
 	si := getSolverInfo(s.address)
@@ -98,9 +105,9 @@ func (s *httpSolver) CleanUp(domain, token, keyAuth string) error {
 		atomic.StoreInt32(&s.closed, 1)
 		if si.listener != nil {
 			si.listener.Close()
+			<-si.done
 		}
 		delete(solvers, s.address)
-		<-si.done
 	}
 	return nil
 }
@@ -115,20 +122,20 @@ type tlsALPNSolver struct {
 
 // Present adds the certificate to the certificate cache and, if
 // needed, starts a TLS server for answering TLS-ALPN challenges.
-func (s *tlsALPNSolver) Present(domain, token, keyAuth string) error {
+func (s *tlsALPNSolver) Present(ctx context.Context, chal acme.Challenge) error {
 	// load the certificate into the cache; this isn't strictly necessary
 	// if we're using the distributed solver since our GetCertificate
 	// function will check storage for the keyAuth anyway, but it seems
 	// like loading it into the cache is the right thing to do
-	cert, err := tlsalpn01.ChallengeCert(domain, keyAuth)
+	cert, err := acmez.TLSALPN01ChallengeCert(chal)
 	if err != nil {
 		return err
 	}
 	certHash := hashCertificateChain(cert.Certificate)
 	s.config.certCache.mu.Lock()
-	s.config.certCache.cache[tlsALPNCertKeyName(domain)] = Certificate{
+	s.config.certCache.cache[tlsALPNCertKeyName(chal.Identifier.Value)] = Certificate{
 		Certificate: *cert,
-		Names:       []string{domain},
+		Names:       []string{chal.Identifier.Value},
 		hash:        certHash, // perhaps not necesssary
 	}
 	s.config.certCache.mu.Unlock()
@@ -144,22 +151,32 @@ func (s *tlsALPNSolver) Present(domain, token, keyAuth string) error {
 	si := getSolverInfo(s.address)
 	si.count++
 	if si.listener != nil {
-		return nil
+		return nil // already be served by us
 	}
 
-	si.listener, err = tls.Listen("tcp", s.address, s.config.TLSConfig())
-	if err != nil {
-		if listenerAddressInUse(s.address) {
-			// if it failed just because the socket is already in use, we
-			// have no choice but to assume that whatever is using the socket
-			// can answer the challenge already
-			return nil
-		}
-		// otherwise, if the socket is not in use, something is wrong
-		return fmt.Errorf("could not start listener for TLS-ALPN challenge server: %v", err)
+	// notice the unusual error handling here; we
+	// only continue to start a challenge server if
+	// we got a listener; in all other cases return
+	ln, err := robustTryListen(s.address)
+	if ln == nil {
+		return err
 	}
+
+	// we were able to bind the socket, so make it into a TLS
+	// listener, store it with the solverInfo, and start the
+	// challenge server
+
+	si.listener = tls.NewListener(ln, s.config.TLSConfig())
 
 	go func() {
+		defer func() {
+			if err := recover(); err != nil {
+				buf := make([]byte, stackTraceBufferSize)
+				buf = buf[:runtime.Stack(buf, false)]
+				log.Printf("panic: tls-alpn solver server: %v\n%s", err, buf)
+			}
+		}()
+		defer close(si.done)
 		for {
 			conn, err := si.listener.Accept()
 			if err != nil {
@@ -178,6 +195,13 @@ func (s *tlsALPNSolver) Present(domain, token, keyAuth string) error {
 
 // handleConn completes the TLS handshake and then closes conn.
 func (*tlsALPNSolver) handleConn(conn net.Conn) {
+	defer func() {
+		if err := recover(); err != nil {
+			buf := make([]byte, stackTraceBufferSize)
+			buf = buf[:runtime.Stack(buf, false)]
+			log.Printf("panic: tls-alpn solver handler: %v\n%s", err, buf)
+		}
+	}()
 	defer conn.Close()
 	tlsConn, ok := conn.(*tls.Conn)
 	if !ok {
@@ -193,9 +217,9 @@ func (*tlsALPNSolver) handleConn(conn net.Conn) {
 
 // CleanUp removes the challenge certificate from the cache, and if
 // it is the last one to finish, stops the TLS server.
-func (s *tlsALPNSolver) CleanUp(domain, token, keyAuth string) error {
+func (s *tlsALPNSolver) CleanUp(ctx context.Context, chal acme.Challenge) error {
 	s.config.certCache.mu.Lock()
-	delete(s.config.certCache.cache, tlsALPNCertKeyName(domain))
+	delete(s.config.certCache.cache, tlsALPNCertKeyName(chal.Identifier.Value))
 	s.config.certCache.mu.Unlock()
 
 	solversMu.Lock()
@@ -207,9 +231,9 @@ func (s *tlsALPNSolver) CleanUp(domain, token, keyAuth string) error {
 		atomic.StoreInt32(&si.closed, 1)
 		if si.listener != nil {
 			si.listener.Close()
+			<-si.done
 		}
 		delete(solvers, s.address)
-		close(si.done)
 	}
 
 	return nil
@@ -221,6 +245,138 @@ func (s *tlsALPNSolver) CleanUp(domain, token, keyAuth string) error {
 // be, since the cert cache is keyed by hash of certificate chain).
 func tlsALPNCertKeyName(sniName string) string {
 	return sniName + ":acme-tls-alpn"
+}
+
+// DNS01Solver is a type that makes libdns providers usable
+// as ACME dns-01 challenge solvers.
+// See https://github.com/libdns/libdns
+type DNS01Solver struct {
+	// The implementation that interacts with the DNS
+	// provider to set or delete records. (REQUIRED)
+	DNSProvider ACMEDNSProvider
+
+	// The TTL for the temporary challenge records.
+	TTL time.Duration
+
+	// Maximum time to wait for temporary record to appear.
+	PropagationTimeout time.Duration
+
+	txtRecords   map[string]dnsPresentMemory // keyed by domain name
+	txtRecordsMu sync.Mutex
+}
+
+// Present creates the DNS TXT record for the given ACME challenge.
+func (s *DNS01Solver) Present(ctx context.Context, challenge acme.Challenge) error {
+	dnsName := challenge.DNS01TXTRecordName()
+	keyAuth := challenge.DNS01KeyAuthorization()
+
+	rec := libdns.Record{
+		Type:  "TXT",
+		Name:  dnsName,
+		Value: keyAuth,
+		TTL:   s.TTL,
+	}
+
+	zone, err := findZoneByFQDN(dnsName, recursiveNameservers)
+	if err != nil {
+		return fmt.Errorf("could not determine zone for domain %q: %v", dnsName, err)
+	}
+
+	results, err := s.DNSProvider.AppendRecords(ctx, zone, []libdns.Record{rec})
+	if err != nil {
+		return fmt.Errorf("adding temporary record for zone %s: %w", zone, err)
+	}
+	if len(results) != 1 {
+		return fmt.Errorf("expected one record, got %d: %v", len(results), results)
+	}
+
+	// remember the record and zone we got so we can clean up more efficiently
+	s.txtRecordsMu.Lock()
+	if s.txtRecords == nil {
+		s.txtRecords = make(map[string]dnsPresentMemory)
+	}
+	s.txtRecords[dnsName] = dnsPresentMemory{dnsZone: zone, rec: results[0]}
+	s.txtRecordsMu.Unlock()
+
+	return nil
+}
+
+// Wait blocks until the TXT record created in Present() appears in
+// authoritative lookups, i.e. until it has propagated, or until
+// timeout, whichever is first.
+func (s *DNS01Solver) Wait(ctx context.Context, challenge acme.Challenge) error {
+	dnsName := challenge.DNS01TXTRecordName()
+	keyAuth := challenge.DNS01KeyAuthorization()
+
+	timeout := s.PropagationTimeout
+	if timeout == 0 {
+		timeout = 2 * time.Minute
+	}
+	const interval = 2 * time.Second
+
+	var err error
+	start := time.Now()
+	for time.Since(start) < timeout {
+		select {
+		case <-time.After(interval):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		var ready bool
+		ready, err = checkDNSPropagation(dnsName, keyAuth)
+		if err != nil {
+			return fmt.Errorf("checking DNS propagation of %s: %w", dnsName, err)
+		}
+		if ready {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("timed out waiting for record to fully propagate; verify DNS provider configuration is correct - last error: %v", err)
+}
+
+// CleanUp deletes the DNS TXT record created in Present().
+func (s *DNS01Solver) CleanUp(ctx context.Context, challenge acme.Challenge) error {
+	dnsName := challenge.DNS01TXTRecordName()
+
+	defer func() {
+		// always forget about it so we don't leak memory
+		s.txtRecordsMu.Lock()
+		delete(s.txtRecords, dnsName)
+		s.txtRecordsMu.Unlock()
+	}()
+
+	// recall the record we created and zone we looked up
+	s.txtRecordsMu.Lock()
+	memory, ok := s.txtRecords[dnsName]
+	if !ok {
+		s.txtRecordsMu.Unlock()
+		return fmt.Errorf("no memory of presenting a DNS record for %s (probably OK if presenting failed)", challenge.Identifier.Value)
+	}
+	s.txtRecordsMu.Unlock()
+
+	// clean up the record
+	_, err := s.DNSProvider.DeleteRecords(ctx, memory.dnsZone, []libdns.Record{memory.rec})
+	if err != nil {
+		return fmt.Errorf("deleting temporary record for zone %s: %w", memory.dnsZone, err)
+	}
+
+	return nil
+}
+
+type dnsPresentMemory struct {
+	dnsZone string
+	rec     libdns.Record
+}
+
+// ACMEDNSProvider defines the set of operations required for
+// ACME challenges. A DNS provider must be able to append and
+// delete records in order to solve ACME challenges. Find one
+// you can use at https://github.com/libdns. If your provider
+// isn't implemented yet, feel free to contribute!
+type ACMEDNSProvider interface {
+	libdns.RecordAppender
+	libdns.RecordDeleter
 }
 
 // distributedSolver allows the ACME HTTP-01 and TLS-ALPN challenges
@@ -254,7 +410,7 @@ type distributedSolver struct {
 	// Since the distributedSolver is only a
 	// wrapper over an actual solver, place
 	// the actual solver here.
-	providerServer challenge.Provider
+	solver acmez.Solver
 
 	// The CA endpoint URL associated with
 	// this solver.
@@ -264,36 +420,32 @@ type distributedSolver struct {
 // Present invokes the underlying solver's Present method
 // and also stores domain, token, and keyAuth to the storage
 // backing the certificate cache of dhs.acmeManager.
-func (dhs distributedSolver) Present(domain, token, keyAuth string) error {
-	infoBytes, err := json.Marshal(challengeInfo{
-		Domain:  domain,
-		Token:   token,
-		KeyAuth: keyAuth,
-	})
+func (dhs distributedSolver) Present(ctx context.Context, chal acme.Challenge) error {
+	infoBytes, err := json.Marshal(chal)
 	if err != nil {
 		return err
 	}
 
-	err = dhs.acmeManager.config.Storage.Store(dhs.challengeTokensKey(domain), infoBytes)
+	err = dhs.acmeManager.config.Storage.Store(dhs.challengeTokensKey(chal.Identifier.Value), infoBytes)
 	if err != nil {
 		return err
 	}
 
-	err = dhs.providerServer.Present(domain, token, keyAuth)
+	err = dhs.solver.Present(ctx, chal)
 	if err != nil {
-		return fmt.Errorf("presenting with embedded provider: %v", err)
+		return fmt.Errorf("presenting with embedded solver: %v", err)
 	}
 	return nil
 }
 
 // CleanUp invokes the underlying solver's CleanUp method
 // and also cleans up any assets saved to storage.
-func (dhs distributedSolver) CleanUp(domain, token, keyAuth string) error {
-	err := dhs.acmeManager.config.Storage.Delete(dhs.challengeTokensKey(domain))
+func (dhs distributedSolver) CleanUp(ctx context.Context, chal acme.Challenge) error {
+	err := dhs.acmeManager.config.Storage.Delete(dhs.challengeTokensKey(chal.Identifier.Value))
 	if err != nil {
 		return err
 	}
-	err = dhs.providerServer.CleanUp(domain, token, keyAuth)
+	err = dhs.solver.CleanUp(ctx, chal)
 	if err != nil {
 		return fmt.Errorf("cleaning up embedded provider: %v", err)
 	}
@@ -311,17 +463,13 @@ func (dhs distributedSolver) challengeTokensKey(domain string) string {
 	return path.Join(dhs.challengeTokensPrefix(), StorageKeys.Safe(domain)+".json")
 }
 
-type challengeInfo struct {
-	Domain, Token, KeyAuth string
-}
-
 // solverInfo associates a listener with the
 // number of challenges currently using it.
 type solverInfo struct {
 	closed   int32 // accessed atomically
 	count    int
 	listener net.Listener
-	done     chan struct{} // used to signal when cleanup is finished
+	done     chan struct{} // used to signal when our own solver server is done
 }
 
 // getSolverInfo gets a valid solverInfo struct for address.
@@ -334,14 +482,72 @@ func getSolverInfo(address string) *solverInfo {
 	return si
 }
 
-// listenerAddressInUse returns true if a TCP connection
-// can be made to addr within a short time interval.
-func listenerAddressInUse(addr string) bool {
+// robustTryListen calls net.Listen for a TCP socket at addr.
+// This function may return both a nil listener and a nil error!
+// If it was able to bind the socket, it returns the listener
+// and no error. If it wasn't able to bind the socket because
+// the socket is already in use, then it returns a nil listener
+// and nil error. If it had any other error, it returns the
+// error. The intended error handling logic for this function
+// is to proceed if the returned listener is not nil; otherwise
+// return err (which may also be nil). In other words, this
+// function ignores errors if the socket is already in use,
+// which is useful for our challenge servers, where we assume
+// that whatever is already listening can solve the challenges.
+func robustTryListen(addr string) (net.Listener, error) {
+	var listenErr error
+	for i := 0; i < 2; i++ {
+		// doesn't hurt to sleep briefly before the second
+		// attempt in case the OS has timing issues
+		if i > 0 {
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		// if we can bind the socket right away, great!
+		var ln net.Listener
+		ln, listenErr = net.Listen("tcp", addr)
+		if listenErr == nil {
+			return ln, nil
+		}
+
+		// if it failed just because the socket is already in use, we
+		// have no choice but to assume that whatever is using the socket
+		// can answer the challenge already, so we ignore the error
+		connectErr := dialTCPSocket(addr)
+		if connectErr == nil {
+			return nil, nil
+		}
+
+		// hmm, we couldn't connect to the socket, so something else must
+		// be wrong, right? wrong!! we've had reports across multiple OSes
+		// now that sometimes connections fail even though the OS told us
+		// that the address was already in use; either the listener is
+		// fluctuating between open and closed very, very quickly, or the
+		// OS is inconsistent and contradicting itself; I have been unable
+		// to reproduce this, so I'm now resorting to hard-coding substring
+		// matching in error messages as a really hacky and unreliable
+		// safeguard against this, until we can idenify exactly what was
+		// happening; see the following threads for more info:
+		// https://caddy.community/t/caddy-retry-error/7317
+		// https://caddy.community/t/v2-upgrade-to-caddy2-failing-with-errors/7423
+		if strings.Contains(listenErr.Error(), "address already in use") ||
+			strings.Contains(listenErr.Error(), "one usage of each socket address") {
+			log.Printf("[WARNING] OS reports a contradiction: %v - but we cannot connect to it, with this error: %v; continuing anyway 🤞 (I don't know what causes this... if you do, please help?)", listenErr, connectErr)
+			return nil, nil
+		}
+	}
+	return nil, fmt.Errorf("could not start listener for challenge server at %s: %v", addr, listenErr)
+}
+
+// dialTCPSocket connects to a TCP address just for the sake of
+// seeing if it is open. It returns a nil error if a TCP connection
+// can successfully be made to addr within a short timeout.
+func dialTCPSocket(addr string) error {
 	conn, err := net.DialTimeout("tcp", addr, 250*time.Millisecond)
 	if err == nil {
 		conn.Close()
 	}
-	return err == nil
+	return err
 }
 
 // The active challenge solvers, keyed by listener address,
@@ -351,4 +557,10 @@ func listenerAddressInUse(addr string) bool {
 var (
 	solvers   = make(map[string]*solverInfo)
 	solversMu sync.Mutex
+)
+
+// Interface guards
+var (
+	_ acmez.Solver = (*DNS01Solver)(nil)
+	_ acmez.Waiter = (*DNS01Solver)(nil)
 )

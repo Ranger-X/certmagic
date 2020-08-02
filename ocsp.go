@@ -97,12 +97,12 @@ func stapleOCSP(storage Storage, cert *Certificate, pemBundle []byte) (*ocsp.Res
 	// the certificate. If the OCSP response was not loaded from
 	// storage, we persist it for next time.
 	if ocspResp.Status == ocsp.Good {
-		if ocspResp.NextUpdate.After(cert.NotAfter) {
+		if ocspResp.NextUpdate.After(cert.Leaf.NotAfter) {
 			// uh oh, this OCSP response expires AFTER the certificate does, that's kinda bogus.
 			// it was the reason a lot of Symantec-validated sites (not Caddy) went down
 			// in October 2017. https://twitter.com/mattiasgeniar/status/919432824708648961
 			return ocspResp, fmt.Errorf("invalid: OCSP response for %v valid after certificate expiration (%s)",
-				cert.Names, cert.NotAfter.Sub(ocspResp.NextUpdate))
+				cert.Names, cert.Leaf.NotAfter.Sub(ocspResp.NextUpdate))
 		}
 		cert.Certificate.OCSPStaple = ocspBytes
 		cert.ocsp = ocspResp
@@ -124,7 +124,7 @@ func stapleOCSP(storage Storage, cert *Certificate, pemBundle []byte) (*ocsp.Res
 // IssuingCertificateURL in the certificate. If the []byte and/or ocsp.Response return
 // values are nil, the OCSP status may be assumed OCSPUnknown.
 //
-// Borrowed from github.com/go-acme/lego
+// Borrowed from xenolf.
 func getOCSPForCert(bundle []byte) ([]byte, *ocsp.Response, error) {
 	// TODO: Perhaps this should be synchronized too, with a Locker?
 
